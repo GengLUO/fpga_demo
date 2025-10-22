@@ -9,10 +9,30 @@
 #include <cstring>
 #include <cassert>
 
-static void fill_identity_weight(std::vector<float>& W, int Cin, int Cout) {
-  assert(Cin == Cout);
-  std::fill(W.begin(), W.end(), 0.0f);
-  for (int c = 0; c < Cin; ++c) W[c*Cin + c] = 1.0f; // weight[co*Cin + ci]
+#include <fstream>   // NEW for loading bins
+#include <string>
+
+static bool load_bin(const std::string& path, void* dst, size_t bytes_expected) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    std::cerr << "[load_bin] open failed: " << path << "\n";
+    return false;
+  }
+  // (可选) 检查文件大小
+  f.seekg(0, std::ios::end);
+  std::streamsize sz = f.tellg();
+  f.seekg(0, std::ios::beg);
+  if (sz != static_cast<std::streamsize>(bytes_expected)) {
+    std::cerr << "[load_bin] size mismatch for " << path
+              << " (got " << sz << ", expect " << bytes_expected << ")\n";
+    return false;
+  }
+  f.read(reinterpret_cast<char*>(dst), bytes_expected);
+  if (!f) {
+    std::cerr << "[load_bin] read failed: " << path << "\n";
+    return false;
+  }
+  return true;
 }
 
 int main(int argc, char** argv) {
@@ -24,6 +44,7 @@ int main(int argc, char** argv) {
   int H = std::stoi(argv[2]);
   int W = std::stoi(argv[3]);
   int C = std::stoi(argv[4]);
+  std::string weights_dir = (argc >= 6) ? argv[5] : std::string("weights");
 
   if ((C & 7) != 0) {
     std::cerr << "Error: C must be multiple of 8 for Shift8.\n";
@@ -81,16 +102,15 @@ int main(int argc, char** argv) {
     std::uniform_real_distribution<float> dist(-1.f, 1.f);
     for (size_t i = 0; i < bytes_inout/sizeof(float); ++i) in_ptr[i] = dist(rng);
 
-    // Weights: identity; Bias: zero
-    {
-      std::vector<float> W(C*C), W2(C*C), B(C, 0.f), B2(C, 0.f);
-      fill_identity_weight(W, C, C);
-      fill_identity_weight(W2, C, C);
-      std::memcpy(w1_ptr, W.data(), bytes_w);
-      std::memcpy(w2_ptr, W2.data(), bytes_w);
-      std::memcpy(b1_ptr, B.data(), bytes_b);
-      std::memcpy(b2_ptr, B2.data(), bytes_b);
-    }
+    // Load weights & bias from files
+    std::string w1p = weights_dir + "/w1.bin";
+    std::string b1p = weights_dir + "/b1.bin";
+    std::string w2p = weights_dir + "/w2.bin";
+    std::string b2p = weights_dir + "/b2.bin";
+    if (!load_bin(w1p, w1_ptr, bytes_w)) return 2;
+    if (!load_bin(b1p, b1_ptr, bytes_b)) return 2;
+    if (!load_bin(w2p, w2_ptr, bytes_w)) return 2;
+    if (!load_bin(b2p, b2_ptr, bytes_b)) return 2;
 
     // Sync host->device for all inputs
     bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -104,22 +124,18 @@ int main(int argc, char** argv) {
     // conv1: out -> bo_c1
     auto run_c1 = k_conv1(bo_in, bo_w1, bo_b1, bo_c1, H, W, C, C);
     run_c1.wait();
-    // bo_c1.sync(XCL_BO_SYNC_BO_TO_DEVICE); // ensure data visible to next kernel
 
     // shift8: in=bo_c1, out=bo_s8
     auto run_s8 = k_shift8(bo_c1, bo_s8, H, W, C);
     run_s8.wait();
-    // bo_s8.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // relu: in=bo_s8, out=bo_relu
     auto run_relu = k_relu(bo_s8, bo_relu, H, W, C);
     run_relu.wait();
-    // bo_relu.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // conv2: in=bo_relu, out=bo_c2
     auto run_c2 = k_conv2(bo_relu, bo_w2, bo_b2, bo_c2, H, W, C, C);
     run_c2.wait();
-    // bo_c2.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // add residual: x=bo_in, y=bo_c2, out=bo_out, res_scale=1.0f
     float res_scale = 1.0f;

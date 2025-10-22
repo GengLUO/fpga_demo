@@ -11,6 +11,7 @@
 
 #include <fstream>   // NEW for loading bins
 #include <string>
+#include <iomanip>   // for std::setprecision
 
 static bool load_bin(const std::string& path, void* dst, size_t bytes_expected) {
   std::ifstream f(path, std::ios::binary);
@@ -33,6 +34,30 @@ static bool load_bin(const std::string& path, void* dst, size_t bytes_expected) 
     return false;
   }
   return true;
+}
+
+static void dump_bin(const std::string& path, const void* src, size_t bytes) {
+  std::ofstream f(path, std::ios::binary);
+  f.write(reinterpret_cast<const char*>(src), bytes);
+}
+
+static void dump_csv(const std::string& path, const float* buf,
+                     int H, int W, int C, long long max_rows = -1) {
+  std::ofstream f(path);
+  f.setf(std::ios::fixed);
+  f << std::setprecision(6);
+  f << "y,x,c,val\n";
+  long long count = 0;
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      const size_t base = (static_cast<size_t>(y) * W + x) * C;
+      for (int c = 0; c < C; ++c) {
+        if (max_rows >= 0 && count >= max_rows) return;
+        f << y << ',' << x << ',' << c << ',' << buf[base + c] << '\n';
+        ++count;
+      }
+    }
+  }
 }
 
 int main(int argc, char** argv) {
@@ -101,6 +126,8 @@ int main(int argc, char** argv) {
     std::mt19937 rng(123);
     std::uniform_real_distribution<float> dist(-1.f, 1.f);
     for (size_t i = 0; i < bytes_inout/sizeof(float); ++i) in_ptr[i] = dist(rng);
+    dump_bin("01_input.bin", in_ptr, bytes_inout);
+    dump_csv("01_input.csv", in_ptr, H, W, C);
 
     // Load weights & bias from files
     std::string w1p = weights_dir + "/w1.bin";
@@ -124,28 +151,44 @@ int main(int argc, char** argv) {
     // conv1: out -> bo_c1
     auto run_c1 = k_conv1(bo_in, bo_w1, bo_b1, bo_c1, H, W, C, C);
     run_c1.wait();
+    bo_c1.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    dump_bin("02_c1.bin",   bo_c1.map<void*>(), bytes_inout);
+    dump_csv("02_c1.csv",   bo_c1.map<float*>(), H, W, C);
 
     // shift8: in=bo_c1, out=bo_s8
     auto run_s8 = k_shift8(bo_c1, bo_s8, H, W, C);
     run_s8.wait();
+    bo_s8.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    dump_bin("03_s8.bin",   bo_s8.map<void*>(), bytes_inout);
+    dump_csv("03_s8.csv",   bo_s8.map<float*>(), H, W, C);
 
     // relu: in=bo_s8, out=bo_relu
     auto run_relu = k_relu(bo_s8, bo_relu, H, W, C);
     run_relu.wait();
+    bo_relu.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    dump_bin("04_relu.bin", bo_relu.map<void*>(), bytes_inout);
+    dump_csv("04_relu.csv", bo_relu.map<float*>(), H, W, C);
 
     // conv2: in=bo_relu, out=bo_c2
     auto run_c2 = k_conv2(bo_relu, bo_w2, bo_b2, bo_c2, H, W, C, C);
     run_c2.wait();
+    bo_c2.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    dump_bin("05_c2.bin",   bo_c2.map<void*>(), bytes_inout);
+    dump_csv("05_c2.csv",   bo_c2.map<float*>(), H, W, C);
 
     // add residual: x=bo_in, y=bo_c2, out=bo_out, res_scale=1.0f
     float res_scale = 1.0f;
     auto run_add = k_add(bo_in, bo_c2, bo_out, res_scale, H, W, C);
     run_add.wait();
+    bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    dump_bin("06_out.bin",  bo_out.map<void*>(), bytes_inout);
+    dump_csv("06_out.csv",  bo_out.map<float*>(), H, W, C);
 
     // 7) Copy back and print a few samples
     bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     auto* out_ptr = bo_out.map<const float*>();
-
+    dump_bin("07_final_output.bin", out_ptr, bytes_inout);
+    dump_csv("07_final_output.csv", out_ptr, H, W, C);
 
     std::cout << "Done. Sample outputs:\n";
     int HW = H*W;

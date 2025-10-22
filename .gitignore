@@ -1,2 +1,14 @@
 *.out
 Vitis_Accel_Examples
+
+_x/
+.ipcache/
+build/
+.Xil/
+
+*.log
+
+test/
+
+scnet/
+scnet_step1_host/

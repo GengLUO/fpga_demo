@@ -125,23 +125,25 @@ static bool load_layer_weights(
 
 int main(int argc, char** argv) {
   if (argc < 5) {
-    std::cerr << "Usage: " << argv[0] << " <xclbin> <H> <W> <C> [weights_dir] [input_bin]\n";
+    std::cerr << "Usage: " << argv[0] << " <xclbin> <H> <W> <C> [Cin0] [weights_dir] [input_bin] [ref_out] [num_layers]\n";
     return 1;
   }
   const char* xclbin_path = argv[1];
   int H = std::stoi(argv[2]);
   int W = std::stoi(argv[3]);
   int C = std::stoi(argv[4]);
-  std::string weights_dir = (argc >= 6) ? argv[5] : std::string("weights");
-  std::string input_path  = (argc >= 7) ? argv[6] : std::string();
-  std::string ref_out_path= (argc >= 8) ? argv[7] : std::string();
+  int Cin0 = (argc >= 6) ? std::stoi(argv[5]) : C;   // 新增：输入通道
+  std::string weights_dir = (argc >= 7) ? argv[6] : std::string("weights");
+  std::string input_path  = (argc >= 8) ? argv[7] : std::string();
+  std::string ref_out_path= (argc >= 9) ? argv[8] : std::string();
   int L = 16;
-  if (argc >= 9) {
-    L = std::stoi(argv[8]);
+  if (argc >= 10) {
+    L = std::stoi(argv[9]);
     if (L <= 0) { std::cerr << "Error: num_layers must be > 0\n"; return 1; }
   }
   std::cout << "[INFO] num_layers = " << L << "\n";
-
+  std::cout << "[INFO] H=" << H << " W=" << W << " C=" << C
+            << " Cin0=" << Cin0 << " L=" << L << "\n";
   if ((C & 7) != 0) {
     std::cerr << "Error: C must be multiple of 8 for Shift8.\n";
     return 1;
@@ -162,12 +164,20 @@ int main(int argc, char** argv) {
 
     // 3) Sizes (bytes)
     size_t bytes_inout = static_cast<size_t>(H) * W * C * sizeof(float);
+    size_t bytes_in0   = static_cast<size_t>(H) * W * Cin0 * sizeof(float);  // 预处理输入 H W Cin0
+    size_t bytes_w0    = static_cast<size_t>(C) * Cin0 * sizeof(float);      // conv_first [C x Cin0]
+    size_t bytes_b0    = static_cast<size_t>(C) * sizeof(float);             // conv_first [C]
     size_t bytes_w     = static_cast<size_t>(C) * C * sizeof(float); // Cin=Cout=C
     size_t bytes_b     = static_cast<size_t>(C) * sizeof(float);
 
     // 4) Allocate BOs on appropriate memory groups
-    // conv1 args: in(0), weight(1), bias(2), out(3), H,W,Cin,Cout (scalars)
-    // auto bo_in   = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_conv1.group_id(0));
+    // 4.1 预处理（Cin0 -> C）
+    auto bo_prein  = xrt::bo(device, bytes_in0,   xrt::bo::flags::normal, k_conv1.group_id(0));
+    auto bo_preout = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_conv1.group_id(3));
+    auto bo_w0     = xrt::bo(device, bytes_w0,    xrt::bo::flags::normal, k_conv1.group_id(1));
+    auto bo_b0     = xrt::bo(device, bytes_b0,    xrt::bo::flags::normal, k_conv1.group_id(2));
+
+    // 4.2 主体 ping-pong 输入（C 通道）
     // 把原来的 bo_in 改为 ping-pong：bo_io[0], bo_io[1]
     auto bo_io0 = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_conv1.group_id(0));
     auto bo_io1 = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_conv1.group_id(0));
@@ -177,6 +187,7 @@ int main(int argc, char** argv) {
     auto bo_w1   = xrt::bo(device, bytes_w,     xrt::bo::flags::normal, k_conv1.group_id(1));
     auto bo_b1   = xrt::bo(device, bytes_b,     xrt::bo::flags::normal, k_conv1.group_id(2));
 
+    // 中间产物
     // shift8 args: in(0), out(1), H,W,C
     auto bo_s8   = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_shift8.group_id(1)); // shift8 out
 
@@ -192,26 +203,51 @@ int main(int argc, char** argv) {
     auto bo_out  = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_add.group_id(2));   // final out
 
     // 5) Map & initialize host-side data
-    // auto* in_ptr  = bo_in.map<float*>();
-    auto* in0_ptr = bo_io0.map<float*>();   // 初始输入写到 io0
+    auto* prein_ptr = bo_prein.map<float*>(); // 初始输入写到 Cin0 BO
+    auto* w0_ptr = bo_w0.map<float*>();
+    auto* b0_ptr = bo_b0.map<float*>();
     auto* w1_ptr  = bo_w1.map<float*>();
     auto* b1_ptr  = bo_b1.map<float*>();
     auto* w2_ptr  = bo_w2.map<float*>();
     auto* b2_ptr  = bo_b2.map<float*>();
 
-    // 5.1) 输入：从文件读（NHWC/float32）
-    std::cout << "[INFO] Loading input from " << input_path << " ...\n";
-    if (!load_bin(input_path, in0_ptr, bytes_inout)) return 2;
-
+    // 5) 读输入（NHWC float32, Cin0 通道）
+    std::cout << "[INFO] Loading input (Cin0=" << Cin0 << ") from " << input_path << " ...\n";
+    if (!load_bin(input_path, prein_ptr, bytes_in0)) return 2;
 #ifdef DEBUG_MODE
-    dump_bin("01_input.bin", in0_ptr, bytes_inout);
-    dump_csv("01_input.csv", in0_ptr, H, W, C);
+    dump_bin("00_input_Cin0.bin", prein_ptr, bytes_in0);
+#endif
+    bo_prein.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    // 6) 读 conv_first 权重
+    if (!load_bin(weights_dir + "/conv_first/w.bin", w0_ptr, bytes_w0)) return 2;
+    if (!load_bin(weights_dir + "/conv_first/b.bin", b0_ptr, bytes_b0)) return 2;
+    bo_w0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_b0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    // 7) 预处理：conv_first + LeakyReLU(0.1)，输出落到 bo_io0
+#ifdef TIME
+    auto t0 = std::chrono::high_resolution_clock::now();
+#endif
+    auto r0 = k_conv1(bo_prein, bo_w0, bo_b0, bo_preout, H, W, Cin0, C);
+    r0.wait();
+#ifdef TIME
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::cout << "[PRE] conv_first "
+              << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms\n";
+    t0 = std::chrono::high_resolution_clock::now();
+#endif
+    float alpha0 = 0.1f;
+    auto r1 = k_relu(bo_preout, bo_io0, H, W, C, alpha0);
+    r1.wait();
+#ifdef TIME
+    t1 = std::chrono::high_resolution_clock::now();
+    std::cout << "[PRE] leaky_relu "
+              << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms\n";
 #endif
 
-    // 初始输入 sync -> device
-    bo_io0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
 // ---- 6) 主循环：依次跑 L 层 ----
+cur = 0; // 主体从 bo_io0 开始
 auto t_start = std::chrono::high_resolution_clock::now();
 for (int l = 0; l < L; ++l) {
   std::cout << "[LAYER " << l << "] loading weights...\n";

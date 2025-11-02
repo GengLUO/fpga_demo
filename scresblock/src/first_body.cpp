@@ -17,14 +17,17 @@
 // =======================================================
 
 #ifdef TIME
-  #define TSTART() auto __t0 = std::chrono::high_resolution_clock::now()
-  #define TEND(msg) do { \
+  // 计时宏（带变量名，避免同一作用域多次重复定义）
+  #define TSTART(tag) auto tag = std::chrono::high_resolution_clock::now()
+  #define TEND(tag, msg) do { \
     auto __t1 = std::chrono::high_resolution_clock::now(); \
-    std::cout << msg << std::chrono::duration<double, std::milli>(__t1 - __t0).count() << " ms\n"; \
+    std::cout << msg \
+      << std::chrono::duration<double, std::milli>(__t1 - (tag)).count() \
+      << " ms\n"; \
   } while (0)
 #else
-  #define TSTART()    do {} while (0)
-  #define TEND(msg)   do {} while (0)
+  #define TSTART(tag)    do {} while (0)
+  #define TEND(tag, msg) do {} while (0)
 #endif
 
 // ========================= 工具函数 =========================
@@ -51,8 +54,12 @@ static bool load_bin(const std::string& path, void* dst, size_t bytes_expected) 
 }
 
 static void dump_bin(const std::string& path, const void* src, size_t bytes) {
+#ifdef DEBUG_MODE
   std::ofstream f(path, std::ios::binary);
   f.write(reinterpret_cast<const char*>(src), bytes);
+#else
+  (void)path; (void)src; (void)bytes;
+#endif
 }
 
 static void dump_csv(const std::string& path, const float* buf,
@@ -215,9 +222,7 @@ int main(int argc, char** argv) {
     // 7) 输入（NHWC, Cin0）
     std::cout << "[INFO] Loading input (Cin0=" << Cin0 << ") from " << input_path << " ...\n";
     if (!load_bin(input_path, prein_ptr, bytes_in0)) return 2;
-#ifdef DEBUG_MODE
     dump_bin("00_input_Cin0.bin", prein_ptr, bytes_in0);
-#endif
     bo_prein.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // 8) conv_first 权重
@@ -228,21 +233,21 @@ int main(int argc, char** argv) {
 
     // 9) 预处理：conv_first → LeakyReLU(0.1) → bo_io0
     {
-      TSTART();
+      TSTART(t_pre_conv);
       auto r0 = k_conv1(bo_prein, bo_w0, bo_b0, bo_preout, H, W, Cin0, C);
       r0.wait();
-      TEND("[PRE] conv_first ");
+      TEND(t_pre_conv, "[PRE] conv_first ");
 
-      TSTART();
+      TSTART(t_pre_lrelu);
       float alpha0 = 0.1f;
       auto r1 = k_relu(bo_preout, bo_io0, H, W, C, alpha0);
       r1.wait();
-      TEND("[PRE] leaky_relu ");
+      TEND(t_pre_lrelu, "[PRE] leaky_relu ");
     }
     cur = 0; // 主体从 bo_io0 开始
 
     // 10) 主体循环：L 个 SCNet 残差 Shift 块
-    auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_loop_start = std::chrono::high_resolution_clock::now();
     for (int l = 0; l < L; ++l) {
       std::cout << "[LAYER " << l << "] loading weights...\n";
       if (!load_block_weights(l, weights_dir, w1_ptr, b1_ptr, w2_ptr, b2_ptr,
@@ -255,35 +260,35 @@ int main(int argc, char** argv) {
       auto& bo_next = (cur == 0 ? bo_io1 : bo_io0);
 
       // conv1
-      TSTART();
-      auto run_c1 = k_conv1(bo_in,  bo_w1, bo_b1, bo_c1, H, W, C, C);
+      TSTART(t_c1);
+      auto run_c1 = k_conv1(bo_in,  bo_w1,  bo_b1,  bo_c1, H, W, C, C);
       run_c1.wait();
-      TEND(("[L" + std::to_string(l) + "] k_conv1 ").c_str());
+      TEND(t_c1, ("[L" + std::to_string(l) + "] k_conv1 ").c_str());
 
       // shift8
-      TSTART();
+      TSTART(t_s8);
       auto run_s8 = k_shift8(bo_c1, bo_s8, H, W, C);
       run_s8.wait();
-      TEND(("[L" + std::to_string(l) + "] k_shift8 ").c_str());
+      TEND(t_s8, ("[L" + std::to_string(l) + "] k_shift8 ").c_str());
 
       // ReLU (alpha=0.0)
-      TSTART();
-      auto run_relu = k_relu(bo_s8, bo_relu, H, W, C, 0.0f);
+      TSTART(t_relu);
+      auto run_relu = k_relu(bo_s8,  bo_relu, H, W, C, 0.0f);
       run_relu.wait();
-      TEND(("[L" + std::to_string(l) + "] k_relu ").c_str());
+      TEND(t_relu, ("[L" + std::to_string(l) + "] k_relu ").c_str());
 
       // conv2
-      TSTART();
+      TSTART(t_c2);
       auto run_c2 = k_conv2(bo_relu, bo_w2,  bo_b2,  bo_c2, H, W, C, C);
       run_c2.wait();
-      TEND(("[L" + std::to_string(l) + "] k_conv2 ").c_str());
+      TEND(t_c2, ("[L" + std::to_string(l) + "] k_conv2 ").c_str());
 
       // add residual
-      TSTART();
+      TSTART(t_add);
       float res_scale = 1.0f;
       auto run_add = k_add(bo_in, bo_c2, bo_out, res_scale, H, W, C);
       run_add.wait();
-      TEND(("[L" + std::to_string(l) + "] add_residual ").c_str());
+      TEND(t_add, ("[L" + std::to_string(l) + "] add_residual ").c_str());
 
 #ifdef DEBUG_MODE
       bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -299,19 +304,16 @@ int main(int argc, char** argv) {
       bo_next.copy(bo_out);
       cur ^= 1;
     }
-    auto t_end = std::chrono::high_resolution_clock::now();
-    std::cout << "[TIME] Inference for " << L << " layers took "
-              << std::chrono::duration<double, std::milli>(t_end - t_start).count() << " ms\n";
-    std::cout << "[TIME] Per-layer average: "
-              << std::chrono::duration<double, std::milli>(t_end - t_start).count() / L << " ms\n";
+    auto t_loop_end = std::chrono::high_resolution_clock::now();
+    double loop_ms = std::chrono::duration<double, std::milli>(t_loop_end - t_loop_start).count();
+    std::cout << "[TIME] Inference for " << L << " layers took " << loop_ms << " ms\n";
+    std::cout << "[TIME] Per-layer average: " << (loop_ms / L) << " ms\n";
 
     // 11) 最终输出（在 bo_io[cur]）
     auto& bo_final = (cur == 0 ? bo_io0 : bo_io1);
     bo_final.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-#ifdef DEBUG_MODE
     dump_bin("final_out.bin", bo_final.map<void*>(), bytes_inout);
     dump_csv("final_out.csv", bo_final.map<float*>(), H, W, C);
-#endif
 
     // 12) 参考对比（可选）
     if (!ref_out_path.empty()) {

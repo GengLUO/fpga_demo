@@ -215,6 +215,7 @@ int main(int argc, char** argv) {
     xrt::kernel k_shift8{device, uuid, "shift8_ddr"};
     xrt::kernel k_relu  {device, uuid, "leaky_relu_ddr"};
     xrt::kernel k_add   {device, uuid, "add_residual_ddr"};
+    xrt::kernel k_ps2{device, uuid, "pixelshuffle2x_ddr"};
 
     // sizes
     const size_t bytes_inout = (size_t)H * W * C * sizeof(float);
@@ -386,19 +387,17 @@ int main(int argc, char** argv) {
     std::cout<<"[U1] convB C->4C\n";
     { auto r=k_conv2(bo_c_tmp, bo_w2_u1, bo_b2_u1, bo_c4_tmp1, H,W,C,C4); r.wait(); }
 
-    std::cout<<"[U1] CPU PixelShuffle (H,W,4C)->(2H,2W,C)\n";
-#if DEBUG_MODE
-    bo_c4_tmp1.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    dump_bin("U1_B_out_hw4c.bin", bo_c4_tmp1.map<void*>(), (size_t)H*W*(4*C)*sizeof(float));
-    dump_csv("U1_B_out_hw4c.csv",  bo_c4_tmp1.map<float*>(), H, W, (4*C));
-#endif
-    { auto* pin=bo_c4_tmp1.map<const float*>(); auto* pout=bo_u1_out.map<float*>(); cpu_pixelshuffle2x_nhwc(pin,pout,H,W,C); }
-    bo_u1_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    std::cout<<"[U1] PS2 kernel (H,W,4C)->(2H,2W,C)\n";
+    // 输入: bo_c4_tmp1 形状 HxWx(4C)
+    // 输出: bo_u1_out   形状 (2H)x(2W)xC
+    { auto r = k_ps2(bo_c4_tmp1, bo_u1_out, H, W, C); r.wait(); }
 
 #if DEBUG_MODE
+    bo_u1_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     dump_bin("U1_out_2h2wc.bin", bo_u1_out.map<void*>(), (size_t)(2*H)*(2*W)*C*sizeof(float));
-    dump_csv("U1_out_2h2wc.csv",  bo_u1_out.map<float*>(), H2,W2,C);
+    dump_csv("U1_out_2h2wc.csv",  bo_u1_out.map<float*>(), 2*H, 2*W, C);
 #endif
+
 
     std::cout<<"[U1] post lrelu(0.1)\n";
     { auto r=k_relu(bo_u1_out, bo_u1_out, H2,W2,C, 0.1f); r.wait(); }
@@ -445,20 +444,15 @@ int main(int argc, char** argv) {
     std::cout<<"[U2] convB C->4C\n";
     { auto r=k_conv2(bo_c_tmp2, bo_w2_u2, bo_b2_u2, bo_c4_tmp2, H2,W2,C,C4); r.wait(); }
 
-    std::cout<<"[U2] CPU PixelShuffle (2H,2W,4C)->(4H,4W,C)\n";
-#if DEBUG_MODE
-    bo_c4_tmp2.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-#endif
-    { auto* pin=bo_c4_tmp2.map<const float*>(); auto* pout=bo_u2_out.map<float*>(); cpu_pixelshuffle2x_nhwc(pin,pout,H2,W2,C); }
-    bo_u2_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-    std::cout<<"[U2] post lrelu(0.1)\n";
-    { auto r=k_relu(bo_u2_out, bo_u2_out, H4,W4,C, 0.1f); r.wait(); }
+    std::cout<<"[U2] PS2 kernel (2H,2W,4C)->(4H,4W,C)\n";
+    // 输入: bo_c4_tmp2 形状 (2H)x(2W)x(4C)
+    // 输出: bo_u2_out   形状 (4H)x(4W)xC
+    { auto r = k_ps2(bo_c4_tmp2, bo_u2_out, H2, W2, C); r.wait(); }
 
 #if DEBUG_MODE
     bo_u2_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     dump_bin("U2_out.bin", bo_u2_out.map<void*>(), (size_t)H4*W4*C*sizeof(float));
-    dump_csv("U2_out.csv",  bo_u2_out.map<float*>(), H4,W4,C);
+    dump_csv("U2_out.csv",  bo_u2_out.map<float*>(), H4, W4, C);
 #endif
 
     std::cout<<"[DONE] BODY + U1 + U2 ok.\n";

@@ -12,7 +12,7 @@
 #include <cassert>
 #include <chrono>
 
-#define DEBUG_MODE 0
+#define DEBUG_MODE 1
 // #define TIME 1
 
 #ifdef TIME
@@ -46,7 +46,7 @@ static bool load_bin(const std::string& path, void* dst, size_t bytes_expected) 
 }
 
 static void dump_bin(const std::string& path, const void* src, size_t bytes) {
-#if DEBUG_MODE
+#ifdef DEBUG_MODE
   std::ofstream f(path, std::ios::binary);
   f.write(reinterpret_cast<const char*>(src), bytes);
 #else
@@ -56,7 +56,7 @@ static void dump_bin(const std::string& path, const void* src, size_t bytes) {
 
 static void dump_csv(const std::string& path, const float* buf,
                      int H, int W, int C, long long max_rows=-1) {
-#if DEBUG_MODE
+#ifdef DEBUG_MODE
   std::ofstream f(path);
   f.setf(std::ios::fixed);
   f << std::setprecision(17);
@@ -77,7 +77,6 @@ static void dump_csv(const std::string& path, const float* buf,
 static void compare_and_report(const float* a, const float* b,
                                size_t N, int H, int W, int C,
                                const char* tag = "FINAL") {
-#if DEBUG_MODE
   double mse=0.0, max_abs=0.0; size_t max_pos=0;
   for (size_t i=0;i<N;++i) {
     double d=(double)a[i]-(double)b[i];
@@ -90,43 +89,42 @@ static void compare_and_report(const float* a, const float* b,
   std::cout<<"[CHECK-"<<tag<<"] N="<<N<<"  MSE="<<std::scientific<<mse
            <<"  max_abs="<<max_abs<<" at (y="<<yy<<", x="<<xx<<", c="<<cc<<")\n"
            <<std::defaultfloat;
-#else
-  (void)a; (void)b; (void)N; (void)H; (void)W; (void)C; (void)tag;
-#endif
 }
 
 // ------------- CPU PixelShuffle2x (NHWC) -------------
 static inline void cpu_pixelshuffle2x_nhwc(const float* in, float* out,
                                            int H, int W, int C)
 {
-  const int Cin = 4 * C;
-  const int outH = 2 * H, outW = 2 * W;
+    const int Cin = 4 * C;
+    const int outH = 2 * H, outW = 2 * W;
 
-  auto idx_in  = [W, Cin](int y, int x, int c)->size_t {
-    return ((size_t)y * W + (size_t)x) * Cin + c;
-  };
-  auto idx_out = [outW, C](int y, int x, int c)->size_t {
-    return ((size_t)y * outW + (size_t)x) * C + c;
-  };
+    auto idx_in  = [W, Cin](int y, int x, int c)->size_t {
+        return ((size_t)y * W + (size_t)x) * Cin + c;
+    };
+    auto idx_out = [outW, C](int y, int x, int c)->size_t {
+        return ((size_t)y * outW + (size_t)x) * C + c;
+    };
 
-  for (int y = 0; y < H; ++y) {
-    const int oy = y << 1;
-    for (int x = 0; x < W; ++x) {
-      const int ox = x << 1;
-      for (int c = 0; c < C; ++c) {
-        const int base = 4 * c;
-        const float v00 = in[idx_in(y, x, base + 0)];
-        const float v01 = in[idx_in(y, x, base + 1)];
-        const float v10 = in[idx_in(y, x, base + 2)];
-        const float v11 = in[idx_in(y, x, base + 3)];
-        out[idx_out(oy,   ox,   c)] = v00;
-        out[idx_out(oy,   ox+1, c)] = v01;
-        out[idx_out(oy+1, ox,   c)] = v10;
-        out[idx_out(oy+1, ox+1, c)] = v11;
-      }
+    for (int y = 0; y < H; ++y) {
+        const int oy = y << 1;
+        for (int x = 0; x < W; ++x) {
+            const int ox = x << 1;
+            for (int c = 0; c < C; ++c) {
+                const int base = 4 * c;  // 关键：每个输出通道跨 4
+                const float v00 = in[idx_in(y, x, base + 0)]; // (i=0,j=0)
+                const float v01 = in[idx_in(y, x, base + 1)]; // (i=0,j=1)
+                const float v10 = in[idx_in(y, x, base + 2)]; // (i=1,j=0)
+                const float v11 = in[idx_in(y, x, base + 3)]; // (i=1,j=1)
+
+                out[idx_out(oy,   ox,   c)] = v00;
+                out[idx_out(oy,   ox+1, c)] = v01;
+                out[idx_out(oy+1, ox,   c)] = v10;
+                out[idx_out(oy+1, ox+1, c)] = v11;
+            }
+        }
     }
-  }
 }
+
 
 // ------------- weight loaders -------------
 static bool load_block_weights(
@@ -215,7 +213,6 @@ int main(int argc, char** argv) {
     xrt::kernel k_shift8{device, uuid, "shift8_ddr"};
     xrt::kernel k_relu  {device, uuid, "leaky_relu_ddr"};
     xrt::kernel k_add   {device, uuid, "add_residual_ddr"};
-    xrt::kernel k_ps2{device, uuid, "pixelshuffle2x_ddr"};
 
     // sizes
     const size_t bytes_inout = (size_t)H * W * C * sizeof(float);
@@ -237,14 +234,14 @@ int main(int argc, char** argv) {
     int cur = 0;
 
     auto bo_c1   = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_conv1.group_id(3));
-    auto bo_w1   = xrt::bo(device, bytes_w,     xrt::bo::flags::normal, k_conv1.group_id(1));
+    auto bo_w1   = xrt::bo(device, bytes_w,     xrt::bo::flags::normal, k_conv1.group_id(1)); // body weights CxC
     auto bo_b1   = xrt::bo(device, bytes_b,     xrt::bo::flags::normal, k_conv1.group_id(2));
 
     auto bo_s8   = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_shift8.group_id(1));
     auto bo_relu_b= xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_relu.group_id(1));
 
     auto bo_c2   = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_conv2.group_id(3));
-    auto bo_w2   = xrt::bo(device, bytes_w,     xrt::bo::flags::normal, k_conv2.group_id(1));
+    auto bo_w2   = xrt::bo(device, bytes_w,     xrt::bo::flags::normal, k_conv2.group_id(1)); // body weights CxC
     auto bo_b2   = xrt::bo(device, bytes_b,     xrt::bo::flags::normal, k_conv2.group_id(2));
 
     auto bo_out  = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_add.group_id(2));
@@ -317,8 +314,7 @@ int main(int argc, char** argv) {
     std::cout << "[TIME] Inference for " << L << " layers took "
               << std::chrono::duration<double,std::milli>(t_loop_end - t_loop_start).count() << " ms\n";
 
-    // BODY 对齐（仅调试时读取与导出）
-#if DEBUG_MODE
+    // BODY 对齐
     { auto& bo_final = (cur==0?bo_io0:bo_io1);
       bo_final.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
       dump_bin("body_final.bin", bo_final.map<void*>(), bytes_inout);
@@ -330,7 +326,6 @@ int main(int argc, char** argv) {
         }
       }
     }
-#endif
 
     // ---------------- U1: upconv1 + PS2 + LReLU(0.1) ----------------
     std::cout << "[U1] begin\n";
@@ -341,7 +336,7 @@ int main(int argc, char** argv) {
     auto bo_c4_tmp1  = xrt::bo(device, bytes_c4_hw, xrt::bo::flags::normal, k_conv2.group_id(3)); // HxWx4C
     auto bo_u1_out   = xrt::bo(device, bytes_2xC,   xrt::bo::flags::normal, k_relu.group_id(1));  // 2Hx2WxC
 
-    // U1 权重 BO
+    // U1 权重 BO（独立分配）
     auto bo_w1_u1 = xrt::bo(device, (size_t)C * C   * sizeof(float), xrt::bo::flags::normal, k_conv1.group_id(1));
     auto bo_b1_u1 = xrt::bo(device, (size_t)C       * sizeof(float), xrt::bo::flags::normal, k_conv1.group_id(2));
     auto bo_w2_u1 = xrt::bo(device, (size_t)C4 * C  * sizeof(float), xrt::bo::flags::normal, k_conv2.group_id(1));
@@ -356,57 +351,51 @@ int main(int argc, char** argv) {
     }
 
     auto& bo_body_out = (cur==0?bo_io0:bo_io1);
+    // bo_body_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    // auto bo_u1_in = xrt::bo(device, bytes_inout, xrt::bo::flags::normal, k_conv1.group_id(0));
+    // bo_u1_in.copy(bo_body_out);
+    // bo_u1_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     std::cout<<"[U1] convA C->C\n";
+    // { auto r=k_conv1(bo_u1_in, bo_w1_u1, bo_b1_u1, bo_c_tmp, H,W,C,C); r.wait(); }
     { auto r = k_conv1(bo_body_out, bo_w1_u1, bo_b1_u1, bo_c_tmp, H, W, C, C); r.wait(); }
-
-#if DEBUG_MODE
     bo_c_tmp.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     dump_bin("U1_A_out.bin", bo_c_tmp.map<void*>(), (size_t)H*W*C*sizeof(float));
     dump_csv("U1_A_out.csv",  bo_c_tmp.map<float*>(), H,W,C);
-#endif
 
     std::cout<<"[U1] lrelu(0.02)\n";
     { auto r=k_relu(bo_c_tmp, bo_c_tmp, H,W,C, 0.02f); r.wait(); }
-
-#if DEBUG_MODE
-    bo_c_tmp.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    dump_bin("U1_A_relu.bin", bo_c_tmp.map<void*>(), (size_t)H*W*C*sizeof(float));
-    dump_csv("U1_A_relu.csv", bo_c_tmp.map<float*>(), H,W,C);
-#endif
+    // after lrelu(0.02) (H,W,C)
+bo_c_tmp.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+dump_bin("U1_A_relu.bin", bo_c_tmp.map<void*>(), (size_t)H*W*C*sizeof(float));
+dump_csv("U1_A_relu.csv", bo_c_tmp.map<float*>(), H,W,C);
 
     std::cout<<"[U1] shift8\n";
     { auto r=k_shift8(bo_c_tmp, bo_c_tmp, H,W,C); r.wait(); }
-
-#if DEBUG_MODE
-    bo_c_tmp.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    dump_bin("U1_shift.bin", bo_c_tmp.map<void*>(), (size_t)H*W*C*sizeof(float));
-    dump_csv("U1_shift.csv", bo_c_tmp.map<float*>(), H,W,C);
-#endif
+    // after shift8 (H,W,C)
+bo_c_tmp.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+dump_bin("U1_shift.bin", bo_c_tmp.map<void*>(), (size_t)H*W*C*sizeof(float));
+dump_csv("U1_shift.csv", bo_c_tmp.map<float*>(), H,W,C);
 
     std::cout<<"[U1] convB C->4C\n";
     { auto r=k_conv2(bo_c_tmp, bo_w2_u1, bo_b2_u1, bo_c4_tmp1, H,W,C,C4); r.wait(); }
 
-    std::cout<<"[U1] PS2 kernel (H,W,4C)->(2H,2W,C)\n";
-    // 输入: bo_c4_tmp1 形状 HxWx(4C)
-    // 输出: bo_u1_out   形状 (2H)x(2W)xC
-    { auto r = k_ps2(bo_c4_tmp1, bo_u1_out, H, W, C); r.wait(); }
+    std::cout<<"[U1] CPU PixelShuffle (H,W,4C)->(2H,2W,C)\n";
+    bo_c4_tmp1.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    dump_bin("U1_B_out_hw4c.bin", bo_c4_tmp1.map<void*>(), (size_t)H*W*(4*C)*sizeof(float));
+    dump_csv("U1_B_out_hw4c.csv",  bo_c4_tmp1.map<float*>(), H, W, (4*C));
 
-#if DEBUG_MODE
-    bo_u1_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    { auto* pin=bo_c4_tmp1.map<const float*>(); auto* pout=bo_u1_out.map<float*>(); cpu_pixelshuffle2x_nhwc(pin,pout,H,W,C); }
+    bo_u1_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     dump_bin("U1_out_2h2wc.bin", bo_u1_out.map<void*>(), (size_t)(2*H)*(2*W)*C*sizeof(float));
-    dump_csv("U1_out_2h2wc.csv",  bo_u1_out.map<float*>(), 2*H, 2*W, C);
-#endif
-
+    dump_csv("U1_out_2h2wc.csv",  bo_u1_out.map<float*>(), H2,W2,C);
 
     std::cout<<"[U1] post lrelu(0.1)\n";
     { auto r=k_relu(bo_u1_out, bo_u1_out, H2,W2,C, 0.1f); r.wait(); }
 
-#if DEBUG_MODE
     bo_u1_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    dump_bin("U1_out.bin", bo_u1_out.map<void*>(), (size_t)H2*W2*C*sizeof(float));
+    dump_bin("U1_out.bin", bo_u1_out.map<void*>(), bytes_2xC);
     dump_csv("U1_out.csv",  bo_u1_out.map<float*>(), H2,W2,C);
-#endif
 
     // ---------------- U2: upconv2 + PS2 + LReLU(0.1) ----------------
     std::cout << "[U2] begin\n";
@@ -417,7 +406,7 @@ int main(int argc, char** argv) {
     auto bo_c4_tmp2  = xrt::bo(device, bytes_c4_h2w2, xrt::bo::flags::normal, k_conv2.group_id(3)); // 2Hx2Wx4C
     auto bo_u2_out   = xrt::bo(device, bytes_4xC, xrt::bo::flags::normal, k_relu.group_id(1));      // 4Hx4WxC
 
-    // U2 权重 BO
+    // U2 权重 BO（独立分配）
     auto bo_w1_u2 = xrt::bo(device, (size_t)C * C   * sizeof(float), xrt::bo::flags::normal, k_conv1.group_id(1));
     auto bo_b1_u2 = xrt::bo(device, (size_t)C       * sizeof(float), xrt::bo::flags::normal, k_conv1.group_id(2));
     auto bo_w2_u2 = xrt::bo(device, (size_t)C4 * C  * sizeof(float), xrt::bo::flags::normal, k_conv2.group_id(1));
@@ -431,29 +420,32 @@ int main(int argc, char** argv) {
       std::cerr<<"[ERROR] failed to load upconv2 pair\n"; return 2;
     }
 
-    // 直接以 U1 的输出作为 U2 的输入
+    // 输入来自 U1 输出
+    // bo_u1_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    // auto bo_u2_in = xrt::bo(device, (size_t)H2*W2*C*sizeof(float), xrt::bo::flags::normal, k_conv1.group_id(0));
+    // bo_u2_in.copy(bo_u1_out);
+    // bo_u2_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
     std::cout<<"[U2] convA C->C\n";
     { auto r=k_conv1(bo_u1_out, bo_w1_u2, bo_b1_u2, bo_c_tmp2, H2,W2,C,C); r.wait(); }
-
     std::cout<<"[U2] lrelu(0.02)\n";
     { auto r=k_relu(bo_c_tmp2, bo_c_tmp2, H2,W2,C, 0.02f); r.wait(); }
-
     std::cout<<"[U2] shift8\n";
     { auto r=k_shift8(bo_c_tmp2, bo_c_tmp2, H2,W2,C); r.wait(); }
-
     std::cout<<"[U2] convB C->4C\n";
     { auto r=k_conv2(bo_c_tmp2, bo_w2_u2, bo_b2_u2, bo_c4_tmp2, H2,W2,C,C4); r.wait(); }
 
-    std::cout<<"[U2] PS2 kernel (2H,2W,4C)->(4H,4W,C)\n";
-    // 输入: bo_c4_tmp2 形状 (2H)x(2W)x(4C)
-    // 输出: bo_u2_out   形状 (4H)x(4W)xC
-    { auto r = k_ps2(bo_c4_tmp2, bo_u2_out, H2, W2, C); r.wait(); }
+    std::cout<<"[U2] CPU PixelShuffle (2H,2W,4C)->(4H,4W,C)\n";
+    bo_c4_tmp2.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    { auto* pin=bo_c4_tmp2.map<const float*>(); auto* pout=bo_u2_out.map<float*>(); cpu_pixelshuffle2x_nhwc(pin,pout,H2,W2,C); }
+    bo_u2_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-#if DEBUG_MODE
+    std::cout<<"[U2] post lrelu(0.1)\n";
+    { auto r=k_relu(bo_u2_out, bo_u2_out, H4,W4,C, 0.1f); r.wait(); }
+
     bo_u2_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-    dump_bin("U2_out.bin", bo_u2_out.map<void*>(), (size_t)H4*W4*C*sizeof(float));
-    dump_csv("U2_out.csv",  bo_u2_out.map<float*>(), H4, W4, C);
-#endif
+    dump_bin("U2_out.bin", bo_u2_out.map<void*>(), bytes_4xC);
+    dump_csv("U2_out.csv",  bo_u2_out.map<float*>(), H4,W4,C);
 
     std::cout<<"[DONE] BODY + U1 + U2 ok.\n";
 

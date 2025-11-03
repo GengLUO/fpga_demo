@@ -213,6 +213,8 @@ int main(int argc, char** argv) {
     xrt::kernel k_shift8{device, uuid, "shift8_ddr"};
     xrt::kernel k_relu  {device, uuid, "leaky_relu_ddr"};
     xrt::kernel k_add   {device, uuid, "add_residual_ddr"};
+    // xrt::kernel k_ps2{device, uuid, "pixelshuffle2x_ddr"};
+
 
     // sizes
     const size_t bytes_inout = (size_t)H * W * C * sizeof(float);
@@ -390,6 +392,18 @@ dump_csv("U1_shift.csv", bo_c_tmp.map<float*>(), H,W,C);
     dump_bin("U1_out_2h2wc.bin", bo_u1_out.map<void*>(), (size_t)(2*H)*(2*W)*C*sizeof(float));
     dump_csv("U1_out_2h2wc.csv",  bo_u1_out.map<float*>(), H2,W2,C);
 
+//     std::cout<<"[U1] PS2 kernel (H,W,4C)->(2H,2W,C)\n";
+//     // 输入: bo_c4_tmp1 形状 HxWx(4C)
+//     // 输出: bo_u1_out   形状 (2H)x(2W)xC
+//     { auto r = k_ps2(bo_c4_tmp1, bo_u1_out, H, W, C); r.wait(); }
+
+// #if DEBUG_MODE
+//     bo_u1_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+//     dump_bin("U1_out_2h2wc.bin", bo_u1_out.map<void*>(), (size_t)(2*H)*(2*W)*C*sizeof(float));
+//     dump_csv("U1_out_2h2wc.csv",  bo_u1_out.map<float*>(), 2*H, 2*W, C);
+// #endif
+
+
     std::cout<<"[U1] post lrelu(0.1)\n";
     { auto r=k_relu(bo_u1_out, bo_u1_out, H2,W2,C, 0.1f); r.wait(); }
 
@@ -440,6 +454,17 @@ dump_csv("U1_shift.csv", bo_c_tmp.map<float*>(), H,W,C);
     { auto* pin=bo_c4_tmp2.map<const float*>(); auto* pout=bo_u2_out.map<float*>(); cpu_pixelshuffle2x_nhwc(pin,pout,H2,W2,C); }
     bo_u2_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+//     std::cout<<"[U2] PS2 kernel (2H,2W,4C)->(4H,4W,C)\n";
+//     // 输入: bo_c4_tmp2 形状 (2H)x(2W)x(4C)
+//     // 输出: bo_u2_out   形状 (4H)x(4W)xC
+//     { auto r = k_ps2(bo_c4_tmp2, bo_u2_out, H2, W2, C); r.wait(); }
+
+// #if DEBUG_MODE
+//     bo_u2_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+//     dump_bin("U2_out.bin", bo_u2_out.map<void*>(), (size_t)H4*W4*C*sizeof(float));
+//     dump_csv("U2_out.csv",  bo_u2_out.map<float*>(), H4, W4, C);
+// #endif
+
     std::cout<<"[U2] post lrelu(0.1)\n";
     { auto r=k_relu(bo_u2_out, bo_u2_out, H4,W4,C, 0.1f); r.wait(); }
 
@@ -448,6 +473,60 @@ dump_csv("U1_shift.csv", bo_c_tmp.map<float*>(), H,W,C);
     dump_csv("U2_out.csv",  bo_u2_out.map<float*>(), H4,W4,C);
 
     std::cout<<"[DONE] BODY + U1 + U2 ok.\n";
+
+    // ---------------- conv_hr -> LReLU(0.1) -> conv_last ----------------
+    std::cout << "[POST] conv_hr + lrelu + conv_last\n";
+
+    // sizes for post head
+    const size_t bytes_hr_w   = (size_t)C * C * sizeof(float);   // 64x64
+    const size_t bytes_hr_b   = (size_t)C * sizeof(float);       // 64
+    const int C_out_last      = 3;
+    const size_t bytes_last_w = (size_t)C_out_last * C * sizeof(float);  // 3x64
+    const size_t bytes_last_b = (size_t)C_out_last * sizeof(float);      // 3
+    const size_t bytes_4xRGB  = (size_t)H4 * W4 * C_out_last * sizeof(float);
+    // const size_t bytes_4xC    = (size_t)H4 * W4 * C * sizeof(float);
+
+    // buffers
+    auto bo_hr_out     = xrt::bo(device, bytes_4xC,    xrt::bo::flags::normal, k_conv1.group_id(3)); // 4Hx4WxC
+    auto bo_final_out  = xrt::bo(device, bytes_4xRGB,  xrt::bo::flags::normal, k_conv2.group_id(3)); // 4Hx4Wx3
+
+    auto bo_w_hr   = xrt::bo(device, bytes_hr_w,   xrt::bo::flags::normal, k_conv1.group_id(1));
+    auto bo_b_hr   = xrt::bo(device, bytes_hr_b,   xrt::bo::flags::normal, k_conv1.group_id(2));
+    auto bo_w_last = xrt::bo(device, bytes_last_w, xrt::bo::flags::normal, k_conv2.group_id(1));
+    auto bo_b_last = xrt::bo(device, bytes_last_b, xrt::bo::flags::normal, k_conv2.group_id(2));
+
+    float* w_hr   = bo_w_hr.map<float*>();
+    float* b_hr   = bo_b_hr.map<float*>();
+    float* w_last = bo_w_last.map<float*>();
+    float* b_last = bo_b_last.map<float*>();
+
+    // load weights
+    if (!load_bin(weights_dir + "/conv_hr/w.bin",   w_hr,   bytes_hr_w))   return 2;
+    if (!load_bin(weights_dir + "/conv_hr/b.bin",   b_hr,   bytes_hr_b))   return 2;
+    if (!load_bin(weights_dir + "/conv_last/w.bin", w_last, bytes_last_w)) return 2;
+    if (!load_bin(weights_dir + "/conv_last/b.bin", b_last, bytes_last_b)) return 2;
+
+    bo_w_hr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_b_hr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_w_last.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    bo_b_last.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    // conv_hr: C -> C on (4H,4W)
+    { auto r = k_conv1(bo_u2_out, bo_w_hr, bo_b_hr, bo_hr_out, H4, W4, C, C); r.wait(); }
+
+    // lrelu(0.1)
+    { auto r = k_relu(bo_hr_out, bo_hr_out, H4, W4, C, 0.1f); r.wait(); }
+
+    // conv_last: C -> 3
+    { auto r = k_conv2(bo_hr_out, bo_w_last, bo_b_last, bo_final_out, H4, W4, C, C_out_last); r.wait(); }
+
+#if DEBUG_MODE
+    bo_final_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    dump_bin("final_out.bin", bo_final_out.map<void*>(), bytes_4xRGB);
+    dump_csv("final_out.csv", bo_final_out.map<float*>(), H4, W4, C_out_last);
+#endif
+
+    std::cout<<"[DONE] BODY + U1 + U2 + conv_hr + conv_last ok.\n";
 
   } catch (const std::exception& e) {
     std::cerr << "Exception: " << e.what() << "\n";

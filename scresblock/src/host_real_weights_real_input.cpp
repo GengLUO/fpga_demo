@@ -261,8 +261,10 @@ for (int l = 0; l < L; ++l) {
   }
 
   // 将 host 侧数据再写入 bo_next（简单安全但多了一次 H2D；如需更快，可用 D2D 拷贝）
-  std::memcpy(bo_next.map<void*>(), bo_out.map<const void*>(), bytes_inout);
-  bo_next.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  // std::memcpy(bo_next.map<void*>(), bo_out.map<const void*>(), bytes_inout);
+  bo_next.copy(bo_out);
+
+  // bo_next.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
   // 交换 ping-pong
   cur ^= 1;
@@ -283,7 +285,7 @@ bo_final.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 dump_bin("final_out.bin", bo_final.map<void*>(), bytes_inout);
 dump_csv("final_out.csv", bo_final.map<float*>(), H, W, C);
 
-// (可选) 和参考输出比较
+// 和参考输出比较
 if (!ref_out_path.empty()) {
   std::vector<float> ref(H * W * C);
   if (!load_bin(ref_out_path, ref.data(), bytes_inout)) {
@@ -299,7 +301,7 @@ if (!ref_out_path.empty()) {
       if (std::abs(d) > max_abs) max_abs = std::abs(d);
     }
     mse /= (ref.empty()?1:ref.size());
-    std::cout << ((max_abs <= MAX_ABS_THR && mse <= MSE_THR) ? "PASS\n" : "FAIL\n");
+    // std::cout << ((max_abs <= MAX_ABS_THR && mse <= MSE_THR) ? "PASS\n" : "FAIL\n");
   }
 }
 

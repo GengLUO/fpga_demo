@@ -11,8 +11,10 @@
 #include <iomanip>
 #include <cassert>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 
-#define DEBUG_MODE 1
+// #define DEBUG_MODE 1
 // #define TIME 1
 
 #ifdef TIME
@@ -85,10 +87,47 @@ static void compare_and_report(const float* a, const float* b,
     if (ad>max_abs) { max_abs=ad; max_pos=i; }
   }
   mse/= (N?N:1);
-  int yy=(max_pos/C)/W; int xx=(max_pos/C)%W; int cc=(int)(max_pos% C);
+  int yy=(int)((max_pos/C)/W); int xx=(int)((max_pos/C)%W); int cc=(int)(max_pos% C);
   std::cout<<"[CHECK-"<<tag<<"] N="<<N<<"  MSE="<<std::scientific<<mse
            <<"  max_abs="<<max_abs<<" at (y="<<yy<<", x="<<xx<<", c="<<cc<<")\n"
            <<std::defaultfloat;
+}
+
+static bool write_ppm_from_nhwc_float(const std::string& path,
+                                      const float* nhwc, int H, int W) {
+  if (!nhwc) return false;
+  const int C = 3;
+  const size_t N = (size_t)H * W * C;
+  std::vector<unsigned char> rgb8(N);
+
+  for (int y = 0; y < H; ++y) {
+    for (int x = 0; x < W; ++x) {
+      size_t base = ((size_t)y * W + x) * C;
+      float r = std::clamp(nhwc[base + 0], 0.0f, 1.0f);
+      float g = std::clamp(nhwc[base + 1], 0.0f, 1.0f);
+      float b = std::clamp(nhwc[base + 2], 0.0f, 1.0f);
+      rgb8[base + 0] = static_cast<unsigned char>(r * 255.0f);
+      rgb8[base + 1] = static_cast<unsigned char>(g * 255.0f);
+      rgb8[base + 2] = static_cast<unsigned char>(b * 255.0f);
+    }
+  }
+
+  std::ofstream f(path, std::ios::binary);
+  if (!f) {
+    std::cerr << "[write_ppm] open failed: " << path << "\n";
+    return false;
+  }
+
+  // 写 PPM header
+  f << "P6\n" << W << " " << H << "\n255\n";
+  f.write(reinterpret_cast<const char*>(rgb8.data()),
+          static_cast<std::streamsize>(rgb8.size()));
+
+  if (!f) {
+    std::cerr << "[write_ppm] write failed: " << path << "\n";
+    return false;
+  }
+  return true;
 }
 
 // ------------- weight loaders -------------
@@ -143,7 +182,7 @@ int main(int argc, char** argv) {
   std::cout << "==== HOST: conv_first + BODY + U1 + U2 (CPU PixelShuffle) ====\n";
   if (argc < 5) {
     std::cerr << "Usage: " << argv[0]
-              << " <xclbin> <H> <W> <C> [Cin0] [weights_dir] [input_bin] [ref_out] [num_layers]\n";
+              << " <xclbin> <H> <W> <C> [Cin0] [weights_dir] [input_bin] [ref_out] [num_layers] [base_bin] [out_img]\n";
     return 1;
   }
 
@@ -156,6 +195,8 @@ int main(int argc, char** argv) {
   const std::string input_path  = (argc >= 8) ? argv[7] : "";
   const std::string ref_out_path= (argc >= 9) ? argv[8] : "";
   int L = (argc >= 10) ? std::stoi(argv[9]) : 16;
+  const std::string base_bin_path = (argc >= 11) ? argv[10] : "";
+  const std::string out_img_path  = (argc >= 12) ? argv[11] : "";
   if (L <= 0) { std::cerr << "Error: num_layers must be > 0\n"; return 1; }
 
   const int C4 = 4*C;
@@ -461,12 +502,20 @@ int main(int argc, char** argv) {
     // conv_last: C -> 3
     { auto r = k_conv2(bo_hr_out, bo_w_last, bo_b_last, bo_final_out, H4, W4, C, C_out_last); r.wait(); }
 
-    // dump & (仅最终对齐校验)
+    // dump final output
     bo_final_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
 #if DEBUG_MODE
     dump_bin("final_out.bin", bo_final_out.map<void*>(), bytes_4xRGB);
     dump_csv("final_out.csv", bo_final_out.map<float*>(), H4, W4, C_out_last);
 #endif
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+
+
     if (!ref_out_path.empty()) {
       std::vector<float> ref((size_t)H4*W4*C_out_last);
       if (load_bin(ref_out_path, ref.data(), bytes_4xRGB)) {
@@ -474,6 +523,50 @@ int main(int argc, char** argv) {
                            (size_t)H4*W4*C_out_last, H4, W4, C_out_last, "FINAL");
       } else {
         std::cerr << "[WARN] Couldn't load ref_out: " << ref_out_path << "\n";
+      }
+    }
+
+    // ---------------- (NEW) 与 base.bin 相加 + 输出图片 ----------------
+    if (!base_bin_path.empty()) {
+      std::cout << "[POST] Loading base and adding to final_out ...\n";
+      std::vector<float> base((size_t)H4*W4*C_out_last);
+      if (!load_bin(base_bin_path, base.data(), bytes_4xRGB)) {
+        std::cerr << "[ERROR] failed to load base_bin: " << base_bin_path << "\n";
+        return 2;
+      }
+      const float* final_ptr = bo_final_out.map<const float*>();
+      std::vector<float> sum((size_t)H4*W4*C_out_last);
+      for (size_t i=0;i<sum.size();++i) sum[i] = final_ptr[i] + base[i];
+
+      // 保存 bin/csv
+      {
+        std::ofstream fb("final_plus_base.bin", std::ios::binary);
+        fb.write(reinterpret_cast<const char*>(sum.data()), (std::streamsize)bytes_4xRGB);
+      }
+#if DEBUG_MODE
+      dump_csv("final_plus_base.csv", sum.data(), H4, W4, C_out_last);
+#endif
+
+      // 写图（PPM）
+      if (!out_img_path.empty()) {
+        // 不管扩展名是什么，都写 PPM（如果你想要 PNG 我可以给你换成 lodepng 版本）
+        std::string ppm_path = out_img_path;
+        // 若没有 .ppm 后缀，自动补一个
+        if (ppm_path.size() < 4 || ppm_path.substr(ppm_path.size()-4) != ".ppm")
+          ppm_path += ".ppm";
+        bool ok = write_ppm_from_nhwc_float(ppm_path, sum.data(), H4, W4);
+        if (ok) std::cout << "[POST] Wrote image: " << ppm_path << "\n";
+        else    std::cerr << "[POST] Write image failed: " << ppm_path << "\n";
+      }
+    } else {
+      // 如果没给 base.bin，但给了 out_img_path，我们也可直接把 final_out 写图，便于可视化
+      if (!out_img_path.empty()) {
+        std::string ppm_path = out_img_path;
+        if (ppm_path.size() < 4 || ppm_path.substr(ppm_path.size()-4) != ".ppm")
+          ppm_path += ".ppm";
+        bool ok = write_ppm_from_nhwc_float(ppm_path, bo_final_out.map<const float*>(), H4, W4);
+        if (ok) std::cout << "[POST] Wrote image (final_out only): " << ppm_path << "\n";
+        else    std::cerr << "[POST] Write image failed: " << ppm_path << "\n";
       }
     }
 

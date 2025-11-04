@@ -14,8 +14,8 @@
 #include <algorithm>
 #include <cmath>
 
-// #define DEBUG_MODE 1
-// #define TIME 1
+#define DEBUG_MODE 1
+#define TIME 1
 
 #ifdef TIME
   #define TSTART(tag) auto tag = std::chrono::high_resolution_clock::now()
@@ -359,7 +359,9 @@ int main(int argc, char** argv) {
     auto& bo_body_out = (cur==0?bo_io0:bo_io1);
 
     std::cout<<"[U1] convA C->C\n";
+    TSTART(t_u1_c1);
     { auto r = k_conv1(bo_body_out, bo_w1_u1, bo_b1_u1, bo_c_tmp, H, W, C, C); r.wait(); }
+    TEND(t_u1_c1, "[U1] k_conv1 ");
 #if DEBUG_MODE
     bo_c_tmp.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
     dump_bin("U1_A_out.bin",  bo_c_tmp.map<void*>(), (size_t)H*W*C*sizeof(float));
@@ -383,7 +385,9 @@ int main(int argc, char** argv) {
 #endif
 
     std::cout<<"[U1] convB C->4C\n";
+    TSTART(t_u1_c2);
     { auto r = k_conv2(bo_s8_u1, bo_w2_u1, bo_b2_u1, bo_c4_tmp1, H, W, C, C4); r.wait(); }
+    TEND(t_u1_c2, "[U1] k_conv2 ");
 
     std::cout<<"[U1] CPU PixelShuffle (H,W,4C)->(2H,2W,C)\n";
     bo_c4_tmp1.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -430,7 +434,10 @@ int main(int argc, char** argv) {
     }
 
     std::cout<<"[U2] convA C->C\n";
+    TSTART(t_u2_c1);
     { auto r = k_conv1(bo_u1_out, bo_w1_u2, bo_b1_u2, bo_c_tmp2, H2, W2, C, C); r.wait(); }
+    TEND(t_u2_c1, "[U2] k_conv1 ");
+    
     std::cout<<"[U2] lrelu(0.02)\n";
     { auto r = k_relu(bo_c_tmp2, bo_c_tmp2, H2, W2, C, 0.02f); r.wait(); }
 
@@ -443,7 +450,9 @@ int main(int argc, char** argv) {
 #endif
 
     std::cout<<"[U2] convB C->4C\n";
+    TSTART(t_u2_c2);
     { auto r = k_conv2(bo_s8_u2, bo_w2_u2, bo_b2_u2, bo_c4_tmp2, H2, W2, C, C4); r.wait(); }
+    TEND(t_u2_c2, "[U2] k_conv2 ");
 
     std::cout<<"[U2] PS2 kernel (2H,2W,4C)->(4H,4W,C)\n";
     { auto r = k_ps2(bo_c4_tmp2, bo_u2_out, H2, W2, C); r.wait(); }
